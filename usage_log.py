@@ -36,6 +36,23 @@ def _connect():
         )
         """
     )
+    # 每一轮模型调用一行，用来分析耗时和 token 花在了哪一轮
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS round_log (
+            log_id        INTEGER,  -- 对应 query_log.log_id
+            round_index   INTEGER,  -- 第几轮（从 1 开始）
+            llm_seconds   REAL,     -- 这一轮等模型返回用了多久
+            tool_seconds  REAL,     -- 这一轮执行工具（查表结构、跑 SQL）用了多久
+            input_tokens  INTEGER,  -- 这一轮发给模型的 token
+            output_tokens INTEGER,  -- 这一轮模型生成的 token（含思考）
+            tools         TEXT,     -- 这一轮模型调用了哪些工具，逗号分隔
+            reasoning_tokens INTEGER  -- 输出里属于"思考过程"的 token，不展示给用户
+        )
+        """
+    )
+    if "reasoning_tokens" not in [row[1] for row in conn.execute("PRAGMA table_info(round_log)")]:
+        conn.execute("ALTER TABLE round_log ADD COLUMN reasoning_tokens INTEGER")
     # 早期版本建的表没有 steps_json 这一列，补上
     if "steps_json" not in [row[1] for row in conn.execute("PRAGMA table_info(query_log)")]:
         conn.execute("ALTER TABLE query_log ADD COLUMN steps_json TEXT")
@@ -69,8 +86,17 @@ def log_query(session_id, turn_index, question, record, seconds):
             round(seconds, 1),
         ),
     )
-    conn.commit()
     log_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO round_log VALUES (?,?,?,?,?,?,?,?)",
+        [
+            (log_id, r["round"], r["llm_seconds"], r["tool_seconds"],
+             r["input_tokens"], r["output_tokens"], ",".join(r["tools"]),
+             r.get("reasoning_tokens", 0))
+            for r in record.get("rounds", [])
+        ],
+    )
+    conn.commit()
     conn.close()
     return log_id
 

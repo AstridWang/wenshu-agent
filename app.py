@@ -12,7 +12,7 @@ import streamlit as st
 from openai import OpenAI
 
 import create_db
-from agent import DB_PATH, MODEL, ask, find_api_key, format_answer
+from agent import DB_PATH, KNOWLEDGE, MODEL, ask, find_api_key, format_answer
 from usage_log import list_sessions, load_session, log_query, set_feedback
 
 EXAMPLES = [
@@ -128,6 +128,11 @@ def show_assistant(turn):
         with st.expander("补充说明"):
             st.markdown(final["detail"])
     with st.expander(f"分析过程（调用工具 {len(turn['steps'])} 次）"):
+        rounds = turn.get("rounds") or []
+        if rounds:
+            llm = sum(r["llm_seconds"] for r in rounds)
+            tool = sum(r["tool_seconds"] for r in rounds)
+            st.caption(f"耗时构成：模型 {len(rounds)} 轮共 {llm:.1f} 秒 · 执行查询共 {tool:.2f} 秒")
         show_steps(turn["steps"])
     # 5. 反馈和本次消耗
     left, right = st.columns([1, 3])
@@ -148,6 +153,13 @@ def show_assistant(turn):
 # ---------------------------------------------------------------------------
 # 侧边栏
 # ---------------------------------------------------------------------------
+@st.dialog("业务指标口径", width="large")
+def show_knowledge():
+    st.caption("Agent 按这份口径计算指标。内容来自 knowledge/metrics.md，修改该文件即可调整口径。")
+    # 去掉文件开头给维护者看的标题和说明，从"通用规则"开始展示
+    st.markdown(KNOWLEDGE[KNOWLEDGE.index("## 通用规则"):])
+
+
 def open_session(session_id):
     """重新打开一个历史对话。之后的提问会接在这个对话后面。"""
     turns = load_session(session_id)
@@ -188,6 +200,8 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
+    if st.button("📖 指标口径", use_container_width=True):
+        show_knowledge()
     with st.expander("数据说明"):
         st.markdown(
             "一家在线教育公司 2026 年 4–9 月的**模拟数据**：\n"
@@ -214,7 +228,8 @@ if not turns and "pending" not in st.session_state:
                 st.session_state.pending = example
                 st.rerun()
     st.caption(
-        "每条回答都会标明指标是怎么算的，并可展开查看执行过的每一条 SQL。"
+        "指标按统一的业务口径计算（见左侧“指标口径”），每条回答都会标明用了哪个口径，"
+        "并可展开查看执行过的每一条 SQL。"
         "遇到数据不支持的问题，会直接说明算不了。"
     )
 
@@ -268,6 +283,7 @@ if question:
             "answer": answer,
             "final": record["final"],
             "steps": record["steps"],
+            "rounds": record["rounds"],
             "input_tokens": record["input_tokens"],
             "output_tokens": record["output_tokens"],
             "seconds": seconds,

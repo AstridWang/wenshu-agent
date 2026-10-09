@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 from openai import OpenAI
@@ -17,6 +18,11 @@ DB_PATH = HERE / "edu.db"
 MODEL = "deepseek-flash"
 MAX_STEPS = 10  # 最多循环多少轮，防止模型陷入死循环一直烧钱
 MAX_ROWS = 50   # 查询结果最多返回多少行，防止把几千行数据塞进上下文
+
+# 指标知识库：整份放进提示词。指标只有十几个，全文放得下；
+# 如果以后增长到上百个，就该改成"先检索相关的几条再放进去"，那就是 RAG。
+KNOWLEDGE_PATH = HERE / "knowledge" / "metrics.md"
+KNOWLEDGE = KNOWLEDGE_PATH.read_text(encoding="utf-8")
 
 # ---------------------------------------------------------------------------
 # 一、提示词：给模型的"岗位说明"
@@ -34,9 +40,13 @@ SYSTEM_PROMPT = """你是一家在线教育公司的数据分析助手。用户�
 回答要求：
 - 结论先行：conclusion 直接回答问题并带上关键数字，不超过 100 字。用户问什么答什么，不要扩展到没问的话题。
 - 结论里的每个数字都必须来自查询结果，不得编造。
-- definitions 只列结论里出现的指标，每个指标一条，最多 3 条。问题里的词有歧义时，在结论里用半句话说明你采用的理解。
-- 数据不足以回答时：conclusion 只说明算不了以及缺什么数据。不要用假设、分摊或估算去凑出数字，也不要改为回答另一个问题。发现算不了就立刻提交，不必继续查询。
-- 结果是时间趋势或多项对比时，提供 chart。"""
+- 指标口径以下方《业务指标口径》为准：知识库里有的指标，必须按它的定义和计算方式写 SQL，不要自己另定口径。
+- definitions 只列结论里出现的指标，每个指标一条，最多 3 条，写法与知识库一致。知识库里没有的指标，自行定义并在该条末尾注明“（知识库未定义）”。
+- 问题里的词有歧义时，在结论里用半句话说明你采用的理解。
+- 数据不足以回答时（包括知识库“数据不支持的指标”里列出的情况）：conclusion 只说明算不了以及缺什么数据。不要用假设、分摊或估算去凑出数字，也不要改为回答另一个问题。发现算不了就立刻提交，不必继续查询。
+- 结果是时间趋势或多项对比时，提供 chart。
+
+""" + KNOWLEDGE
 
 # ---------------------------------------------------------------------------
 # 二、工具：模型只能"说"它想调用什么，真正执行的是下面这些普通函数
@@ -213,14 +223,30 @@ def ask(client, question, verbose=True, history=None, on_step=None):
         *(history or []),
         {"role": "user", "content": question},
     ]
-    record = {"question": question, "steps": [], "input_tokens": 0, "output_tokens": 0}
+    record = {"question": question, "steps": [], "rounds": [], "input_tokens": 0, "output_tokens": 0}
     query_count = 0
 
     for step in range(1, MAX_STEPS + 1):
         # 每一轮都把完整的 messages 重新发给模型，模型自己不记得任何东西
+        llm_start = time.time()
         response = client.chat.completions.create(
             model=MODEL, messages=messages, tools=TOOLS
         )
+        # 每一轮单独记一条：等模型用了多久、收发了多少 token、执行工具用了多久。
+        # 用来分析"慢在哪"：是轮数多、某一轮输出长，还是查询本身慢。
+        round_record = {
+            "round": step,
+            "llm_seconds": round(time.time() - llm_start, 2),
+            "input_tokens": response.usage.prompt_tokens,
+            "output_tokens": response.usage.completion_tokens,
+            # 输出 token 里有一部分是模型不展示的"思考过程"，单独记下来
+            "reasoning_tokens": getattr(
+                response.usage.completion_tokens_details, "reasoning_tokens", 0
+            ) or 0,
+            "tool_seconds": 0.0,
+            "tools": [],
+        }
+        record["rounds"].append(round_record)
         record["input_tokens"] += response.usage.prompt_tokens
         record["output_tokens"] += response.usage.completion_tokens
         message = response.choices[0].message
@@ -240,6 +266,8 @@ def ask(client, question, verbose=True, history=None, on_step=None):
             except json.JSONDecodeError:
                 args = {}
 
+            round_record["tools"].append(name)
+
             # 模型交卷了：这是循环的正常出口
             if name == "submit_answer" and args.get("conclusion"):
                 record["final"] = args
@@ -247,11 +275,14 @@ def ask(client, question, verbose=True, history=None, on_step=None):
                 return record["answer"], record
 
             # 其他工具：执行后把结果作为 tool 消息发回去
+            tool_start = time.time()
             try:
                 result = TOOL_FUNCTIONS[name](**args)
             except Exception as e:  # 模型给了不存在的工具名或错误的参数
                 result = f"工具调用失败：{e}"
-            step_record = {"tool": name, "args": args, "result": result}
+            tool_seconds = round(time.time() - tool_start, 3)
+            round_record["tool_seconds"] = round(round_record["tool_seconds"] + tool_seconds, 3)
+            step_record = {"tool": name, "args": args, "result": result, "seconds": tool_seconds}
             content = result
             if name == "run_sql":
                 # 给每次查询编号，模型画图时用编号指明"用哪次查询的结果"
